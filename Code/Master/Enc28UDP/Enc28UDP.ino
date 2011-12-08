@@ -1,3 +1,5 @@
+#define DEBUG
+
 #define BIT0              0x01
 #define BIT1              0x02
 #define BIT2              0x04
@@ -261,9 +263,12 @@
 #define waitspi() while(!(SPSR&(1<<SPIF)))
 
 
-static uint8_t mymac[6] = {0x54,0x55,0xaa,0xdd,0xee,0x24}; 
+static uint8_t myMAC[6] = {0x01,0x02,0x03,0x04,0x05,0x06}; 
+static uint8_t myIP[4] = {192, 168, 1, 55};
 static uint16_t NextPacketPtr;
 static uint8_t Enc28j60Bank;
+#define BUFFER_SIZE 500
+static uint8_t buf[BUFFER_SIZE+1];
 
 
 void Enc28j60Init(uint8_t* macaddr);
@@ -277,6 +282,8 @@ void Enc28j60clkout(uint8_t clk);
 uint8_t Enc28j60getrev(void);
 uint16_t Enc28j60PacketReceive(uint16_t maxlen, uint8_t* packet);
 void Enc28j60ReadBuffer(uint16_t len, uint8_t* data);
+void Enc28j60WriteBuffer(uint16_t len, uint8_t* data);
+void Enc28j60PacketSend(uint16_t len, uint8_t* packet);
 
 
 
@@ -476,6 +483,158 @@ void Enc28j60ReadBuffer(uint16_t len, uint8_t* data) {
 
 
 
+void Enc28j60WriteBuffer(uint16_t len, uint8_t* data) {
+        CSACTIVE;
+        // issue write command
+        SPDR = ENC28J60_WRITE_BUF_MEM;
+        waitspi();
+        while(len)
+        {
+                len--;
+                // write data
+                SPDR = *data;
+                data++;
+                waitspi();
+        }
+        CSPASSIVE;
+}
+
+
+
+
+void Enc28j60PacketSend(uint16_t len, uint8_t* packet) {
+    // Set the write pointer to start of transmit buffer area
+    Enc28j60Write(EWRPTL, TXSTART_INIT&0xFF);
+    Enc28j60Write(EWRPTH, TXSTART_INIT>>8);
+    // Set the TXND pointer to correspond to the packet size given
+    Enc28j60Write(ETXNDL, (TXSTART_INIT+len)&0xFF);
+    Enc28j60Write(ETXNDH, (TXSTART_INIT+len)>>8);
+    // write per-packet control byte (0x00 means use macon3 settings)
+    Enc28j60WriteOp(ENC28J60_WRITE_BUF_MEM, 0, 0x00);
+    // copy the packet into the transmit buffer
+    Enc28j60WriteBuffer(len, packet);
+    // send the contents of the transmit buffer onto the network
+    Enc28j60WriteOp(ENC28J60_BIT_FIELD_SET, ECON1, ECON1_TXRTS);
+    // Reset the transmit logic problem. See Rev. B4 Silicon Errata point 12.
+    if( (Enc28j60Read(EIR) & EIR_TXERIF) ){
+        Enc28j60WriteOp(ENC28J60_BIT_FIELD_CLR, ECON1, ECON1_TXRTS);
+    }
+}
+
+
+
+
+void BuildEthHeader(uint8_t *p) {
+}
+
+
+uint16_t BuildArpReply(uint8_t *p, uint8_t *localMAC, uint8_t *remoteMAC, uint8_t *localIP, uint8_t *remoteIP) {
+  uint16_t i;
+  uint8_t *startP;
+
+  startP=p;
+
+  for (i=0; i<6; i++) {
+      *p++=remoteMAC[i];
+  } 
+
+  for (i=0; i<6; i++) {
+      *p++=localMAC[i];
+  } 
+
+  *p++=0x08;  // ARP
+  *p++=0x06;  
+
+  *p++=0x00;  // Hardware type
+  *p++=0x01;
+
+  *p++=0x08;  // Protocol type
+  *p++=0x00;
+
+  *p++=0x06;  // Hardware size
+
+  *p++=0x04;  // Protocol size
+
+  *p++=0x00;  // Opcode
+  *p++=0x02;
+
+  for (i=0; i<6; i++) {  // Sender MAC
+      *p++=localMAC[i];
+  } 
+  
+  for (i=0; i<4; i++) {  // Sender IP
+      *p++=localIP[i];
+  } 
+
+  for (i=0; i<6; i++) {  // Remote MAC
+      *p++=remoteMAC[i];
+  } 
+  
+  for (i=0; i<4; i++) {  // Remote IP
+      *p++=remoteIP[i];
+  } 
+
+
+  return (p-startP);
+}
+
+
+
+uint16_t BuildPingReply(uint8_t *dst, uint8_t *src, uint16_t length) {
+  int i;
+//   0/6 26/30  34op8->0      
+
+  for (i=0; i<length; i++) {
+    dst[i]=src[i];
+  }
+  
+  for (i=0; i<6; i++) {  // Swap MAC
+    dst[0+i]=src[6+i];
+    dst[6+i]=src[0+i];
+  }
+  
+  for (i=0; i<4; i++) {  // Swap IP
+    dst[26+i]=src[30+i];
+    dst[30+i]=src[26+i];
+  }
+
+  dst[34]=0;             // Reply opcode  
+
+  dst[36]=0x00;             // Zero out checksum
+  dst[37]=0x00;  
+
+   uint32_t sum = 0;
+  uint16_t chksum;
+  uint8_t *p;
+  uint16_t len;
+ 
+ sum=0;
+ p=&dst[34];
+ len=length-34;
+
+  // build the sum of 16bit words
+  while(len >1){
+          sum += 0xFFFF & (*p<<8|*(p+1));
+          p+=2;
+          len-=2;
+  }
+  // if there is a byte left then add it (padded with zero)
+  if (len){
+          sum += (0xFF & *p)<<8;
+  }
+  // now calculate the sum over the bytes in the sum
+  // until the result is only 16bit long
+  while (sum>>16){
+          sum = (sum & 0xFFFF)+(sum >> 16);
+  }
+  // build 1's complement:
+  chksum=( (uint16_t) sum ^ 0xFFFF);
+  dst[36]=chksum>>8;
+  dst[37]=chksum& 0xff;
+
+}
+
+
 void loop() {
 }
 
@@ -483,8 +642,11 @@ void loop() {
 
 
 void setup() { 
+  Serial.begin(115200);
+  Serial.println("Setup()");
+
   /*initialize enc28j60*/
-    Enc28j60Init(mymac);
+    Enc28j60Init(myMAC);
     Enc28j60clkout(2); // change clkout from 6.25MHz to 12.5MHz
     delay(10);
         
@@ -519,9 +681,11 @@ void setup() {
     //init the ethernet/ip layer:
 //    es.E_init_ip_arp_udp_tcp(mymac,myip,80);
 
-  Serial.begin(9600);
-  Serial.println("Setup()");
+  Serial.println("...done1");
   attachInterrupt(0, EncIRQ, FALLING);
+  Serial.println("...done2");
+  EncIRQ();
+  Serial.println("...done3");
 }
 
 
@@ -583,21 +747,28 @@ uint16_t Enc28j60PacketReceive(uint16_t maxlen, uint8_t* packet) {
 
 
 
-#define BUFFER_SIZE 500
-static uint8_t buf[BUFFER_SIZE+1];
 
 
 void EncIRQ() {
-    uint16_t plen, dat_p;
-    int8_t cmd;
-
-    Serial.print("@");
+  uint16_t plen,i;
+  uint8_t sendbuf[128];
   
+  Serial.print("#");
     do {
       plen = Enc28j60PacketReceive(BUFFER_SIZE, buf);
-      // plen will ne unequal to zero if there is a valid packet 
-      if(plen!=0){
-  
+      if(plen!=0) {
+        if (buf[12]==8 && buf[13]==6) { // ARP
+          i=BuildArpReply(sendbuf, myMAC, &buf[22], myIP, &buf[38]);
+          Enc28j60PacketSend(i,sendbuf);
+        } 
+        
+        if (buf[12]==8 && buf[13]==0 && buf[23]==1 && buf[34]==8) { // IP / ICMP / ECHO REQEST
+          BuildPingReply(sendbuf, buf, plen);
+          Enc28j60PacketSend(plen,sendbuf);
+        }
+        if (buf[12]==8 && buf[13]==0 && buf[23]==17 ) { // IP / UDP
+//          Serial.print("u");
+        }
       }
     } while (plen!=0);
 }
@@ -633,6 +804,20 @@ c0a80137 (dst 192.168.1.55)
 
 55000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000aa (udp payload data)
 
+0/6 26/30  34op8->0      
+PING Request
+0000  <LMAC>            <RMAC>             08 00 45 00   ........ 2W.m..E.
+0010  00 3c 1e a7 00 00 80 01  00 00 <RIP>       <LIP>   .<...... ........
+0020       <op>00 42 86 00 01  0a d5 61 62 63 64 65 66   .7..B... ..abcdef
+0030  67 68 69 6a 6b 6c 6d 6e  6f 70 71 72 73 74 75 76   ghijklmn opqrstuv
+0040  77 61 62 63 64 65 66 67  68 69                     wabcdefg hi      
+
+PING Reply
+0000  <RMAC>            <LMAC>             08 00 45 00   ..2W.m.. ......E.
+0010  00 3c 1e a7 40 00 40 01  98 90 <LIP>       <RIP>   .<..@.@. .....7..
+0020       <op>00 4a 86 00 01  0a d5 61 62 63 64 65 66   ....J... ..abcdef
+0030  67 68 69 6a 6b 6c 6d 6e  6f 70 71 72 73 74 75 76   ghijklmn opqrstuv
+0040  77 61 62 63 64 65 66 67  68 69                     wabcdefg hi           
 
 
 */
